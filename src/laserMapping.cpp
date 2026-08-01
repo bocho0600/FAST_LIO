@@ -58,6 +58,8 @@
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/buffer.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
@@ -92,8 +94,9 @@ string map_file_path, lid_topic, imu_topic;
 // map_frame:  world-fixed frame the odometry/path/global clouds are expressed in
 // body_frame: IMU body frame, child of the published odometry and TF
 // lid_frame:  LiDAR sensor frame, only used by the optional body->lidar static TF
-string map_frame, body_frame, lid_frame;
-bool   publish_tf_en = true, publish_tf_lidar_en = false;
+// base_frame: robot base frame, only used by the optional map->base TF
+string map_frame, body_frame, lid_frame, base_frame;
+bool   publish_tf_en = true, publish_tf_lidar_en = false, publish_tf_base_en = false;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -819,6 +822,7 @@ public:
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<bool>("publish.tf_en", true);
         this->declare_parameter<bool>("publish.tf_lidar_en", false);
+        this->declare_parameter<bool>("publish.tf_base_en", false);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -826,6 +830,7 @@ public:
         this->declare_parameter<string>("common.map_frame", "camera_init");
         this->declare_parameter<string>("common.body_frame", "body");
         this->declare_parameter<string>("common.lid_frame", "lidar");
+        this->declare_parameter<string>("common.base_frame", "base_link");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -860,6 +865,7 @@ public:
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<bool>("publish.tf_en", publish_tf_en, true);
         this->get_parameter_or<bool>("publish.tf_lidar_en", publish_tf_lidar_en, false);
+        this->get_parameter_or<bool>("publish.tf_base_en", publish_tf_base_en, false);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -867,6 +873,7 @@ public:
         this->get_parameter_or<string>("common.map_frame", map_frame, "camera_init");
         this->get_parameter_or<string>("common.body_frame", body_frame, "body");
         this->get_parameter_or<string>("common.lid_frame", lid_frame, "lidar");
+        this->get_parameter_or<string>("common.base_frame", base_frame, "base_link");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -980,9 +987,28 @@ public:
             static_tf_broadcaster_->sendTransform(static_trans);
         }
 
-        RCLCPP_INFO(this->get_logger(), "frames: map=%s body=%s lid=%s | tf_en=%d tf_lidar_en=%d",
-                    map_frame.c_str(), body_frame.c_str(), lid_frame.c_str(),
-                    (int)publish_tf_en, (int)publish_tf_lidar_en);
+        /*** map -> base needs TF to find where the base is relative to the sensor ***/
+        if (publish_tf_base_en)
+        {
+            tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+            tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
+
+            /*** a frame may only have one parent, so refuse to claim base_frame twice ***/
+            if (publish_tf_en && body_frame == base_frame)
+            {
+                RCLCPP_ERROR(this->get_logger(),
+                             "publish.tf_en and publish.tf_base_en would both publish %s -> %s. "
+                             "Disabling publish.tf_base_en; set common.body_frame to the IMU frame "
+                             "instead, or turn publish.tf_en off.",
+                             map_frame.c_str(), base_frame.c_str());
+                publish_tf_base_en = false;
+            }
+        }
+
+        RCLCPP_INFO(this->get_logger(),
+                    "frames: map=%s body=%s lid=%s base=%s | tf_en=%d tf_lidar_en=%d tf_base_en=%d",
+                    map_frame.c_str(), body_frame.c_str(), lid_frame.c_str(), base_frame.c_str(),
+                    (int)publish_tf_en, (int)publish_tf_lidar_en, (int)publish_tf_base_en);
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1004,6 +1030,81 @@ public:
     }
 
 private:
+    /**
+     * Broadcast map_frame -> base_frame, i.e. the robot base pose rather than the IMU pose.
+     *
+     * The estimated state is the pose of the IMU body frame, T_map_imu. The robot base is
+     * somewhere else entirely -- on Livox mounts it is routinely rotated as well as offset --
+     * so relabelling the IMU transform as base_frame would report a wrong pose. This composes:
+     *
+     *   T_map_base = T_map_imu * T_imu_lidar * T_lidar_base
+     *
+     * T_imu_lidar is the IMU-LiDAR extrinsic already in the filter state (so it follows
+     * mapping.extrinsic_est_en), and T_lidar_base is read once from TF, which means the robot
+     * description stays the single source of truth for the mounting. The lookup is retried
+     * until it succeeds, since robot_state_publisher may still be starting up.
+     */
+    void publish_base_tf()
+    {
+        if (!_is_base_extrinsic_valid && !resolve_base_extrinsic()) return;
+
+        Eigen::Isometry3d transform_map_imu = Eigen::Isometry3d::Identity();
+        transform_map_imu.linear() = state_point.rot.toRotationMatrix();
+        transform_map_imu.translation() = state_point.pos;
+
+        Eigen::Isometry3d transform_imu_lidar = Eigen::Isometry3d::Identity();
+        transform_imu_lidar.linear() = state_point.offset_R_L_I.toRotationMatrix();
+        transform_imu_lidar.translation() = state_point.offset_T_L_I;
+
+        const Eigen::Isometry3d transform_map_base =
+            transform_map_imu * transform_imu_lidar * _transform_lidar_base;
+        const Eigen::Quaterniond rotation(transform_map_base.rotation());
+
+        geometry_msgs::msg::TransformStamped trans;
+        trans.header.stamp = get_ros_time(lidar_end_time);
+        trans.header.frame_id = map_frame;
+        trans.child_frame_id = base_frame;
+        trans.transform.translation.x = transform_map_base.translation().x();
+        trans.transform.translation.y = transform_map_base.translation().y();
+        trans.transform.translation.z = transform_map_base.translation().z();
+        trans.transform.rotation.w = rotation.w();
+        trans.transform.rotation.x = rotation.x();
+        trans.transform.rotation.y = rotation.y();
+        trans.transform.rotation.z = rotation.z();
+        tf_broadcaster_->sendTransform(trans);
+    }
+
+    /// Read lid_frame -> base_frame from TF once and cache it. Returns whether it is available.
+    bool resolve_base_extrinsic()
+    {
+        geometry_msgs::msg::TransformStamped lookup;
+        try
+        {
+            lookup = tf_buffer_->lookupTransform(lid_frame, base_frame, tf2::TimePointZero);
+        }
+        catch (const tf2::TransformException &ex)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "publish.tf_base_en is set but %s -> %s is not in TF yet (%s). "
+                                 "Not publishing %s -> %s.",
+                                 lid_frame.c_str(), base_frame.c_str(), ex.what(),
+                                 map_frame.c_str(), base_frame.c_str());
+            return false;
+        }
+
+        const Eigen::Quaterniond rotation(lookup.transform.rotation.w, lookup.transform.rotation.x,
+                                          lookup.transform.rotation.y, lookup.transform.rotation.z);
+        _transform_lidar_base = Eigen::Isometry3d::Identity();
+        _transform_lidar_base.linear() = rotation.normalized().toRotationMatrix();
+        _transform_lidar_base.translation() = Eigen::Vector3d(lookup.transform.translation.x,
+                                                             lookup.transform.translation.y,
+                                                             lookup.transform.translation.z);
+        _is_base_extrinsic_valid = true;
+        RCLCPP_INFO(this->get_logger(), "resolved %s -> %s from TF, publishing %s -> %s",
+                    lid_frame.c_str(), base_frame.c_str(), map_frame.c_str(), base_frame.c_str());
+        return true;
+    }
+
     void timer_callback()
     {
         if(sync_packages(Measures))
@@ -1111,6 +1212,7 @@ private:
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            if (publish_tf_base_en) publish_base_tf();
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1190,6 +1292,11 @@ private:
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    /// lid_frame -> base_frame, cached from TF on first use (see publish_base_tf)
+    Eigen::Isometry3d _transform_lidar_base = Eigen::Isometry3d::Identity();
+    bool _is_base_extrinsic_valid = false;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
