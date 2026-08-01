@@ -97,6 +97,11 @@ string map_file_path, lid_topic, imu_topic;
 // base_frame: robot base frame, only used by the optional map->base TF
 string map_frame, body_frame, lid_frame, base_frame;
 bool   publish_tf_en = true, publish_tf_lidar_en = false, publish_tf_base_en = false;
+bool   publish_odom_in_base_en = false;
+// lid_frame -> base_frame, read once from TF (see resolve_base_extrinsic). Needed by both
+// publish.tf_base_en and publish.odom_in_base_en, neither of which may publish before it is valid.
+Eigen::Isometry3d transform_lidar_base = Eigen::Isometry3d::Identity();
+bool   is_base_extrinsic_valid = false;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -636,12 +641,56 @@ void set_posestamp(T & out)
     
 }
 
+/**
+ * Pose of base_frame in map_frame, composed from the estimated IMU pose:
+ *
+ *   T_map_base = T_map_imu * T_imu_lidar * T_lidar_base
+ *
+ * Only valid once is_base_extrinsic_valid is set. T_imu_lidar is taken from the filter state,
+ * so it tracks mapping.extrinsic_est_en.
+ */
+Eigen::Isometry3d get_map_to_base_transform()
+{
+    Eigen::Isometry3d transform_map_imu = Eigen::Isometry3d::Identity();
+    transform_map_imu.linear() = state_point.rot.toRotationMatrix();
+    transform_map_imu.translation() = state_point.pos;
+
+    Eigen::Isometry3d transform_imu_lidar = Eigen::Isometry3d::Identity();
+    transform_imu_lidar.linear() = state_point.offset_R_L_I.toRotationMatrix();
+    transform_imu_lidar.translation() = state_point.offset_T_L_I;
+
+    return transform_map_imu * transform_imu_lidar * transform_lidar_base;
+}
+
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
     odomAftMapped.header.frame_id = map_frame;
-    odomAftMapped.child_frame_id = body_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
+
+    if (publish_odom_in_base_en)
+    {
+        /*** report the robot base rather than the IMU. Publishing nothing is deliberate while
+             the extrinsic is unresolved: the alternative is labelling the IMU pose base_frame,
+             which is exactly the wrong-pose bug this option exists to avoid ***/
+        if (!is_base_extrinsic_valid) return;
+
+        const Eigen::Isometry3d transform_map_base = get_map_to_base_transform();
+        const Eigen::Quaterniond rotation(transform_map_base.rotation());
+        odomAftMapped.child_frame_id = base_frame;
+        odomAftMapped.pose.pose.position.x = transform_map_base.translation().x();
+        odomAftMapped.pose.pose.position.y = transform_map_base.translation().y();
+        odomAftMapped.pose.pose.position.z = transform_map_base.translation().z();
+        odomAftMapped.pose.pose.orientation.w = rotation.w();
+        odomAftMapped.pose.pose.orientation.x = rotation.x();
+        odomAftMapped.pose.pose.orientation.y = rotation.y();
+        odomAftMapped.pose.pose.orientation.z = rotation.z();
+    }
+    else
+    {
+        odomAftMapped.child_frame_id = body_frame;
+        set_posestamp(odomAftMapped.pose);
+    }
+
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
@@ -823,6 +872,7 @@ public:
         this->declare_parameter<bool>("publish.tf_en", true);
         this->declare_parameter<bool>("publish.tf_lidar_en", false);
         this->declare_parameter<bool>("publish.tf_base_en", false);
+        this->declare_parameter<bool>("publish.odom_in_base_en", false);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
@@ -866,6 +916,7 @@ public:
         this->get_parameter_or<bool>("publish.tf_en", publish_tf_en, true);
         this->get_parameter_or<bool>("publish.tf_lidar_en", publish_tf_lidar_en, false);
         this->get_parameter_or<bool>("publish.tf_base_en", publish_tf_base_en, false);
+        this->get_parameter_or<bool>("publish.odom_in_base_en", publish_odom_in_base_en, false);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
@@ -987,8 +1038,8 @@ public:
             static_tf_broadcaster_->sendTransform(static_trans);
         }
 
-        /*** map -> base needs TF to find where the base is relative to the sensor ***/
-        if (publish_tf_base_en)
+        /*** composing a base_frame pose needs TF to find where the base is relative to the sensor ***/
+        if (publish_tf_base_en || publish_odom_in_base_en)
         {
             tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
             tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
@@ -1046,18 +1097,9 @@ private:
      */
     void publish_base_tf()
     {
-        if (!_is_base_extrinsic_valid && !resolve_base_extrinsic()) return;
+        if (!is_base_extrinsic_valid) return;
 
-        Eigen::Isometry3d transform_map_imu = Eigen::Isometry3d::Identity();
-        transform_map_imu.linear() = state_point.rot.toRotationMatrix();
-        transform_map_imu.translation() = state_point.pos;
-
-        Eigen::Isometry3d transform_imu_lidar = Eigen::Isometry3d::Identity();
-        transform_imu_lidar.linear() = state_point.offset_R_L_I.toRotationMatrix();
-        transform_imu_lidar.translation() = state_point.offset_T_L_I;
-
-        const Eigen::Isometry3d transform_map_base =
-            transform_map_imu * transform_imu_lidar * _transform_lidar_base;
+        const Eigen::Isometry3d transform_map_base = get_map_to_base_transform();
         const Eigen::Quaterniond rotation(transform_map_base.rotation());
 
         geometry_msgs::msg::TransformStamped trans;
@@ -1085,23 +1127,23 @@ private:
         catch (const tf2::TransformException &ex)
         {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "publish.tf_base_en is set but %s -> %s is not in TF yet (%s). "
-                                 "Not publishing %s -> %s.",
+                                 "%s -> %s is not in TF yet (%s), so the %s pose cannot be "
+                                 "composed. Is the robot description being published?",
                                  lid_frame.c_str(), base_frame.c_str(), ex.what(),
-                                 map_frame.c_str(), base_frame.c_str());
+                                 base_frame.c_str());
             return false;
         }
 
         const Eigen::Quaterniond rotation(lookup.transform.rotation.w, lookup.transform.rotation.x,
                                           lookup.transform.rotation.y, lookup.transform.rotation.z);
-        _transform_lidar_base = Eigen::Isometry3d::Identity();
-        _transform_lidar_base.linear() = rotation.normalized().toRotationMatrix();
-        _transform_lidar_base.translation() = Eigen::Vector3d(lookup.transform.translation.x,
-                                                             lookup.transform.translation.y,
-                                                             lookup.transform.translation.z);
-        _is_base_extrinsic_valid = true;
-        RCLCPP_INFO(this->get_logger(), "resolved %s -> %s from TF, publishing %s -> %s",
-                    lid_frame.c_str(), base_frame.c_str(), map_frame.c_str(), base_frame.c_str());
+        transform_lidar_base = Eigen::Isometry3d::Identity();
+        transform_lidar_base.linear() = rotation.normalized().toRotationMatrix();
+        transform_lidar_base.translation() = Eigen::Vector3d(lookup.transform.translation.x,
+                                                            lookup.transform.translation.y,
+                                                            lookup.transform.translation.z);
+        is_base_extrinsic_valid = true;
+        RCLCPP_INFO(this->get_logger(), "resolved %s -> %s from TF, now reporting %s",
+                    lid_frame.c_str(), base_frame.c_str(), base_frame.c_str());
         return true;
     }
 
@@ -1211,6 +1253,10 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
+            if ((publish_tf_base_en || publish_odom_in_base_en) && !is_base_extrinsic_valid)
+            {
+                resolve_base_extrinsic();
+            }
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
             if (publish_tf_base_en) publish_base_tf();
 
@@ -1294,9 +1340,6 @@ private:
     std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-    /// lid_frame -> base_frame, cached from TF on first use (see publish_base_tf)
-    Eigen::Isometry3d _transform_lidar_base = Eigen::Isometry3d::Identity();
-    bool _is_base_extrinsic_valid = false;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;

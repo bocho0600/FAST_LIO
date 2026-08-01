@@ -51,6 +51,9 @@
                                          # pose with lid_frame -> base_frame looked up from TF. Use this
                                          # instead of setting body_frame to the base: the estimated pose
                                          # is the IMU's, which is offset (and usually rotated) from the base
+            odom_in_base_en: false       # true: /Odometry reports base_frame instead of body_frame, with the
+                                         # pose composed the same way as tf_base_en. Use when another node
+                                         # (e.g. an EKF) owns the map -> base TF but wants the base pose
 
         pcd_save:
             pcd_save_en: true
