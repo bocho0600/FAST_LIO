@@ -12,6 +12,9 @@
         common:
             lid_topic:  "/os_cloud_node/points"
             imu_topic:  "/os_cloud_node/imu"
+            map_frame:  "camera_init"   # world-fixed frame the odometry/path/global clouds are published in
+            body_frame: "body"          # IMU body frame: child frame of /Odometry and of the published TF
+            lid_frame:  "lidar"         # LiDAR frame, only used when publish.tf_lidar_en is true
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
@@ -40,6 +43,9 @@
             scan_publish_en:  true       # false: close all the point cloud output
             dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
             scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+            tf_en: true                  # false: do not broadcast the map_frame -> body_frame TF
+                                         # (set false when another node, e.g. an EKF, already owns that edge)
+            tf_lidar_en: false           # true: also broadcast a static body_frame -> lid_frame TF from the IMU-LiDAR extrinsic
 
         pcd_save:
             pcd_save_en: true
