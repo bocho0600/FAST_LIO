@@ -83,6 +83,8 @@ bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extri
 bool   gravity_align_en = false;
 // put the world origin on base_frame's initial pose instead of the IMU's
 bool   origin_at_base_en = false;
+// OpenMP threads for the per-point residual loop; <= 0 means one fewer than available
+int    max_threads = 3;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -813,7 +815,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     /** closest surface search and residual computation **/
     #ifdef MP_EN
-        omp_set_num_threads(MP_PROC_NUM);
+        omp_set_num_threads(max_threads);
         #pragma omp parallel for
     #endif
     for (int i = 0; i < feats_down_size; i++)
@@ -939,6 +941,7 @@ public:
         this->declare_parameter<bool>("publish.tf_base_en", false);
         this->declare_parameter<bool>("publish.odom_in_base_en", false);
         this->declare_parameter<int>("max_iteration", 4);
+        this->declare_parameter<int>("max_threads", 3);
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
@@ -987,6 +990,7 @@ public:
         this->get_parameter_or<bool>("publish.tf_base_en", publish_tf_base_en, false);
         this->get_parameter_or<bool>("publish.odom_in_base_en", publish_odom_in_base_en, false);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
+        this->get_parameter_or<int>("max_threads", max_threads, 3);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
@@ -1033,6 +1037,21 @@ public:
         // int effect_feat_num = 0, frame_num = 0;
         // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
         // bool flg_EKF_converged, EKF_stop_flg = 0;
+
+        /*** <= 0 means "size it to this machine", leaving a core for everything else on a
+             robot. Resolved here rather than at build time so the same binary is correct on a
+             28-core desktop and a 6-core Jetson. ***/
+        if (max_threads <= 0)
+        {
+            max_threads = std::max(1, omp_get_max_threads() - 1);
+        }
+#ifdef MP_EN
+        RCLCPP_INFO(this->get_logger(), "residual loop using %d of %d available threads",
+                    max_threads, omp_get_max_threads());
+#else
+        RCLCPP_WARN(this->get_logger(),
+                    "built without OpenMP: the residual loop runs single-threaded");
+#endif
 
         FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
         HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);

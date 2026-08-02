@@ -20,29 +20,28 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 message("Current CPU archtecture: ${CMAKE_SYSTEM_PROCESSOR}")
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
-  include(ProcessorCount)
-  ProcessorCount(N)
-  message("Processer number:  ${N}")
-
-  if(N GREATER 4)
-    add_definitions(-DMP_EN)
-    add_definitions(-DMP_PROC_NUM=3)
-    message("core for MP: 3")
-  elseif(N GREATER 3)
-    add_definitions(-DMP_EN)
-    add_definitions(-DMP_PROC_NUM=2)
-    message("core for MP: 2")
-  else()
-    add_definitions(-DMP_PROC_NUM=1)
-  endif()
-else()
-  add_definitions(-DMP_PROC_NUM=1)
-endif()
-
 find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
+
+# Parallelise the per-point residual loop whenever OpenMP is available.
+#
+# This used to be gated on CMAKE_SYSTEM_PROCESSOR matching x86, so every ARM build -- every
+# Jetson -- compiled without the `#pragma omp parallel for` at all and ran the hottest part
+# of the algorithm on a single core, no matter how many cores the board had.
+#
+# The thread count also came from ProcessorCount() on the *build* host, which says nothing
+# about the machine that runs the result once it is built in a sandbox, on CI, or pulled from
+# a binary cache. Baking a host-detected value into a portable artifact is the same mistake as
+# baking in -march=native. It is now the `max_threads` runtime parameter instead, so one
+# binary behaves correctly on any core count.
+if(OpenMP_CXX_FOUND)
+  add_definitions(-DMP_EN)
+else()
+  message(
+    WARNING "OpenMP not found: the residual loop will run single-threaded, which roughly "
+            "triples per-scan time")
+endif()
 
 find_package(PythonLibs REQUIRED)
 find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")

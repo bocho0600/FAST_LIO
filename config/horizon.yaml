@@ -3,6 +3,10 @@
         feature_extract_enable: false
         point_filter_num: 3
         max_iteration: 3
+        # OpenMP threads for the per-point residual loop, the only parallel section in the
+        # algorithm. 0 or less sizes it to the machine, leaving one core for everything else.
+        # Chosen at runtime, so the same binary suits a many-core desktop and a 6-core Jetson.
+        max_threads: 3
         filter_size_surf: 0.5
         filter_size_map: 0.5
         cube_side_length: 1000.0
