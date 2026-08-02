@@ -39,6 +39,8 @@
 #include <fstream>
 #include <csignal>
 #include <chrono>
+#include <ctime>
+#include <filesystem>
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
@@ -110,6 +112,9 @@ double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+/*** periodic map saving (see the `pcd_save` block of the config files) ***/
+double pcd_save_interval_sec = 0.0;   // <= 0 disables the timer, leaving /map_save on demand only
+bool   pcd_keep_history = false;      // also write a timestamped copy on every save
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -622,10 +627,66 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     // pubLaserCloudMap->publish(laserCloudMap);
 }
 
-void save_to_pcd()
+/**
+ * Write the accumulated map to map_file_path, and to a timestamped sibling when
+ * pcd_save.keep_history is set. Returns false and fills `message` on failure.
+ *
+ * The map lives in pcl_wait_pub, which only publish_map() ever appends to, so an
+ * empty cloud here means publish.map_en is off. That is reported rather than
+ * silently writing a valid-but-empty pcd.
+ */
+bool save_to_pcd(string &message)
 {
-    pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
+    if (map_file_path.empty())
+    {
+        message = "map_file_path is empty.";
+        return false;
+    }
+    if (pcl_wait_pub->empty())
+    {
+        message = "map is empty - is publish.map_en enabled?";
+        return false;
+    }
+
+    try
+    {
+        const std::filesystem::path target(map_file_path);
+        if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path());
+
+        pcl::PCDWriter pcd_writer;
+        if (pcd_writer.writeBinary(map_file_path, *pcl_wait_pub) != 0)
+        {
+            message = "PCDWriter failed to write " + map_file_path;
+            return false;
+        }
+        message = "saved " + to_string(pcl_wait_pub->size()) + " points to " + map_file_path;
+
+        if (pcd_keep_history)
+        {
+            string base = map_file_path, ext;
+            const auto dot = base.rfind('.');
+            if (dot != string::npos)
+            {
+                ext = base.substr(dot);
+                base = base.substr(0, dot);
+            }
+
+            const std::time_t now = std::time(nullptr);
+            char stamp[32] = {0};
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
+
+            const string archived = base + "_" + stamp + ext;
+            std::filesystem::copy_file(map_file_path, archived,
+                                       std::filesystem::copy_options::overwrite_existing);
+            message += " (+ " + archived + ")";
+        }
+    }
+    catch (const std::exception &ex)
+    {
+        message = string("failed to save map: ") + ex.what();
+        return false;
+    }
+    return true;
 }
 
 template<typename T>
@@ -904,6 +965,8 @@ public:
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
+        this->declare_parameter<double>("pcd_save.save_interval_sec", 0.0);
+        this->declare_parameter<bool>("pcd_save.keep_history", false);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
 
@@ -948,6 +1011,8 @@ public:
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
+        this->get_parameter_or<double>("pcd_save.save_interval_sec", pcd_save_interval_sec, 0.0);
+        this->get_parameter_or<bool>("pcd_save.keep_history", pcd_keep_history, false);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
 
@@ -1069,6 +1134,20 @@ public:
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+
+        /*** periodic map saving. Uses the node clock, so unlike a wall timer it honours
+             use_sim_time. Left disabled (interval <= 0) means /map_save on demand only ***/
+        if (pcd_save_en && pcd_save_interval_sec > 0.0)
+        {
+            map_save_timer_ = rclcpp::create_timer(
+                this, this->get_clock(),
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::duration<double>(pcd_save_interval_sec)),
+                std::bind(&LaserMappingNode::map_save_timer_callback, this));
+            RCLCPP_INFO(this->get_logger(), "saving map to %s every %.0f s%s",
+                        map_file_path.c_str(), pcd_save_interval_sec,
+                        pcd_keep_history ? " (keeping timestamped copies)" : "");
+        }
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1311,18 +1390,28 @@ private:
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
-        {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
-        }
-        else
+        if (!pcd_save_en)
         {
             res->success = false;
-            res->message = "Map save disabled.";
+            res->message = "pcd_save.pcd_save_en is false.";
+            RCLCPP_WARN(this->get_logger(), "%s", res->message.c_str());
+            return;
         }
+
+        string message;
+        res->success = save_to_pcd(message);
+        res->message = message;
+        if (res->success) RCLCPP_INFO(this->get_logger(), "%s", message.c_str());
+        else              RCLCPP_WARN(this->get_logger(), "%s", message.c_str());
+    }
+
+    /// Periodic save, enabled by pcd_save.save_interval_sec (see map_save_timer_).
+    void map_save_timer_callback()
+    {
+        string message;
+        if (save_to_pcd(message)) RCLCPP_INFO(this->get_logger(), "%s", message.c_str());
+        else                      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 30000,
+                                                       "periodic map save skipped: %s", message.c_str());
     }
 
 private:
@@ -1343,6 +1432,7 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::TimerBase::SharedPtr map_save_timer_;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
@@ -1365,15 +1455,18 @@ int main(int argc, char** argv)
     if (rclcpp::ok())
         rclcpp::shutdown();
     /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
-    if (pcl_wait_save->size() > 0 && pcd_save_en)
+    /* Save on exit so shutting down does not discard up to a whole
+       pcd_save.save_interval_sec of mapping.
+
+       This used to write pcl_wait_save to ROOT_DIR/PCD/scans.pcd. Neither part worked:
+       pcl_wait_save is only appended to by a block that upstream left commented out, so
+       it was always empty, and ROOT_DIR is read-only when the package is installed to a
+       store path. Use the same buffer and destination as the service instead. */
+    if (pcd_save_en)
     {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        string message;
+        if (save_to_pcd(message)) cout << "map saved on exit: " << message << endl;
+        else                      cout << "map not saved on exit: " << message << endl;
     }
 
     if (runtime_pos_log)
