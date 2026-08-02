@@ -47,6 +47,7 @@ class ImuProcess
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
   void set_gravity_align(bool en);
+  void set_base_offset(const V3D &translation_imu_base);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -81,6 +82,9 @@ class ImuProcess
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
   bool   gravity_align_en = false;
+  /// Where base_frame sits in IMU coordinates, used to move the world origin onto it.
+  V3D    translation_imu_base = Zero3d;
+  bool   is_base_offset_set = false;
 };
 
 ImuProcess::ImuProcess()
@@ -98,6 +102,8 @@ ImuProcess::ImuProcess()
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   gravity_align_en = false;
+  translation_imu_base = Zero3d;
+  is_base_offset_set = false;
   last_imu_.reset(new sensor_msgs::msg::Imu());
 }
 
@@ -161,6 +167,12 @@ void ImuProcess::set_gravity_align(bool en)
   gravity_align_en = en;
 }
 
+void ImuProcess::set_base_offset(const V3D &translation_imu_base_in)
+{
+  translation_imu_base = translation_imu_base_in;
+  is_base_offset_set = true;
+}
+
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
@@ -221,6 +233,21 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
   else
   {
     init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  }
+
+  /*** Move the world origin onto base_frame instead of the IMU.
+   *
+   * The filter's position state is the IMU's, and it starts at zero, so by default the world
+   * origin is wherever the IMU happened to be -- up on the sensor mast, which leaves the
+   * ground plane at a non-zero z and base_link offset from the origin at startup.
+   *
+   * Seeding the position with -R * t_imu_base puts base_frame at the origin instead, while
+   * leaving the orientation (and so the gravity alignment above) untouched. Because this
+   * shifts the state itself rather than the published pose, the map is built in the same
+   * frame and stays consistent with the odometry. ***/
+  if (is_base_offset_set)
+  {
+    init_state.pos = -(init_state.rot * translation_imu_base);
   }
 
   init_state.bg  = mean_gyr;

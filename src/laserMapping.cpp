@@ -81,6 +81,8 @@ int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delet
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 // gravity-align the world frame at init, so map_frame z is up regardless of IMU mounting
 bool   gravity_align_en = false;
+// put the world origin on base_frame's initial pose instead of the IMU's
+bool   origin_at_base_en = false;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -945,6 +947,7 @@ public:
         this->declare_parameter<string>("common.lid_frame", "lidar");
         this->declare_parameter<string>("common.base_frame", "base_link");
         this->declare_parameter<bool>("common.gravity_align_en", false);
+        this->declare_parameter<bool>("common.origin_at_base_en", false);
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -992,6 +995,7 @@ public:
         this->get_parameter_or<string>("common.lid_frame", lid_frame, "lidar");
         this->get_parameter_or<string>("common.base_frame", base_frame, "base_link");
         this->get_parameter_or<bool>("common.gravity_align_en", gravity_align_en, false);
+        this->get_parameter_or<bool>("common.origin_at_base_en", origin_at_base_en, false);
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -1109,7 +1113,7 @@ public:
         }
 
         /*** composing a base_frame pose needs TF to find where the base is relative to the sensor ***/
-        if (publish_tf_base_en || publish_odom_in_base_en)
+        if (publish_tf_base_en || publish_odom_in_base_en || origin_at_base_en)
         {
             tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
             tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
@@ -1127,9 +1131,11 @@ public:
         }
 
         RCLCPP_INFO(this->get_logger(),
-                    "frames: map=%s body=%s lid=%s base=%s | tf_en=%d tf_lidar_en=%d tf_base_en=%d",
+                    "frames: map=%s body=%s lid=%s base=%s | tf_en=%d tf_lidar_en=%d tf_base_en=%d "
+                    "odom_in_base_en=%d origin_at_base_en=%d",
                     map_frame.c_str(), body_frame.c_str(), lid_frame.c_str(), base_frame.c_str(),
-                    (int)publish_tf_en, (int)publish_tf_lidar_en, (int)publish_tf_base_en);
+                    (int)publish_tf_en, (int)publish_tf_lidar_en, (int)publish_tf_base_en,
+                    (int)publish_odom_in_base_en, (int)origin_at_base_en);
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1200,6 +1206,21 @@ private:
         tf_broadcaster_->sendTransform(trans);
     }
 
+    /**
+     * @brief Tell the IMU processor where base_frame sits in IMU coordinates.
+     *
+     * t_imu_base comes from T_imu_lidar (the configured extrinsic) composed with T_lidar_base
+     * (from TF), and lets IMU_init seed the world origin onto base_frame. Must be called
+     * before the first ImuProcess::Process, since that is what triggers initialisation.
+     */
+    void push_base_offset_to_imu() const
+    {
+        Eigen::Isometry3d transform_imu_lidar = Eigen::Isometry3d::Identity();
+        transform_imu_lidar.linear() = Lidar_R_wrt_IMU;
+        transform_imu_lidar.translation() = Lidar_T_wrt_IMU;
+        p_imu->set_base_offset((transform_imu_lidar * transform_lidar_base).translation());
+    }
+
     /// Read lid_frame -> base_frame from TF once and cache it. Returns whether it is available.
     bool resolve_base_extrinsic()
     {
@@ -1235,6 +1256,22 @@ private:
     {
         if(sync_packages(Measures))
         {
+            /*** Resolve lid_frame -> base_frame before the filter initialises. origin_at_base_en
+                 needs it inside IMU_init, so hold off entirely until TF provides it rather than
+                 initialise around the IMU and be silently offset for the rest of the run. ***/
+            if ((publish_tf_base_en || publish_odom_in_base_en || origin_at_base_en) &&
+                !is_base_extrinsic_valid)
+            {
+                if (resolve_base_extrinsic())
+                {
+                    push_base_offset_to_imu();
+                }
+                else if (origin_at_base_en)
+                {
+                    return;
+                }
+            }
+
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
@@ -1337,10 +1374,6 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            if ((publish_tf_base_en || publish_odom_in_base_en) && !is_base_extrinsic_valid)
-            {
-                resolve_base_extrinsic();
-            }
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
             if (publish_tf_base_en) publish_base_tf();
 

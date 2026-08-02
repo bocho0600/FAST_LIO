@@ -21,6 +21,13 @@
                                          # frame is simply the IMU frame at startup, so any mounting
                                          # tilt (or starting slope) tilts the whole map and odometry.
                                          # Only roll/pitch are observable; yaw stays as-started.
+            origin_at_base_en: false     # true: place the world origin on base_frame's initial pose
+                                         # instead of the IMU's. The position state is the IMU's and
+                                         # starts at zero, so by default the origin sits wherever the
+                                         # IMU is mounted -- leaving the ground plane at a non-zero z
+                                         # and base_frame offset from the origin at startup. Needs
+                                         # lid_frame -> base_frame from TF, and the node waits for it
+                                         # before initialising rather than starting off-origin.
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
