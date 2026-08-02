@@ -79,6 +79,8 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+// gravity-align the world frame at init, so map_frame z is up regardless of IMU mounting
+bool   gravity_align_en = false;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -942,6 +944,7 @@ public:
         this->declare_parameter<string>("common.body_frame", "body");
         this->declare_parameter<string>("common.lid_frame", "lidar");
         this->declare_parameter<string>("common.base_frame", "base_link");
+        this->declare_parameter<bool>("common.gravity_align_en", false);
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -988,6 +991,7 @@ public:
         this->get_parameter_or<string>("common.body_frame", body_frame, "body");
         this->get_parameter_or<string>("common.lid_frame", lid_frame, "lidar");
         this->get_parameter_or<string>("common.base_frame", base_frame, "base_link");
+        this->get_parameter_or<bool>("common.gravity_align_en", gravity_align_en, false);
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -1041,6 +1045,7 @@ public:
         Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
         p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
+        p_imu->set_gravity_align(gravity_align_en);
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));

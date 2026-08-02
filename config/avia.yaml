@@ -16,6 +16,11 @@
             body_frame: "body"          # IMU body frame: child frame of /Odometry and of the published TF
             lid_frame:  "lidar"         # LiDAR frame, only used when publish.tf_lidar_en is true
             base_frame: "base_link"     # robot base, only used when publish.tf_base_en is true
+            gravity_align_en: false      # true: rotate the world frame at init so its z axis is up,
+                                         # using the averaged accelerometer. Leave false and the world
+                                         # frame is simply the IMU frame at startup, so any mounting
+                                         # tilt (or starting slope) tilts the whole map and odometry.
+                                         # Only roll/pitch are observable; yaw stays as-started.
             time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
             time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                         # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0

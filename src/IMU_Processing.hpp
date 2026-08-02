@@ -46,6 +46,7 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  void set_gravity_align(bool en);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -79,6 +80,7 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  bool   gravity_align_en = false;
 };
 
 ImuProcess::ImuProcess()
@@ -95,6 +97,7 @@ ImuProcess::ImuProcess()
   angvel_last     = Zero3d;
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
+  gravity_align_en = false;
   last_imu_.reset(new sensor_msgs::msg::Imu());
 }
 
@@ -153,6 +156,11 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
   cov_bias_acc = b_a;
 }
 
+void ImuProcess::set_gravity_align(bool en)
+{
+  gravity_align_en = en;
+}
+
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
@@ -190,9 +198,31 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
-  
-  //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
+
+  if (gravity_align_en)
+  {
+    /*** Gravity-align the world frame.
+     *
+     * By default the world frame is simply the IMU frame at startup, with gravity carried
+     * as an estimated state. That leaves the world tilted by however the IMU is mounted (and
+     * by whatever slope it started on), so z is not up: a level robot reports a non-zero
+     * roll/pitch, and level travel is split between the world x and z axes, which shortens
+     * the distance seen by anything that flattens to 2D.
+     *
+     * At rest the accelerometer measures the reaction to gravity, so mean_acc points along
+     * world "up" expressed in IMU coordinates. Rotating that onto +z gives the IMU's
+     * orientation in a z-up world, and gravity becomes exactly (0, 0, -G).
+     *
+     * Only roll and pitch are observable this way; yaw stays at whatever heading the robot
+     * started with, which is the usual convention for an odometry frame. ***/
+    init_state.rot = SO3(Eigen::Quaterniond::FromTwoVectors(mean_acc.normalized(), V3D(0.0, 0.0, 1.0)));
+    init_state.grav = S2(V3D(0.0, 0.0, -G_m_s2));
+  }
+  else
+  {
+    init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  }
+
   init_state.bg  = mean_gyr;
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;
   init_state.offset_R_L_I = Lidar_R_wrt_IMU;
