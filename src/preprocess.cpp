@@ -1,9 +1,39 @@
 #include "preprocess.h"
 
+#include <cmath>
+
 #include <pcl/common/common.h>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
+
+namespace
+{
+  /**
+   * @brief Is this a usable measurement, i.e. finite and beyond the blind radius?
+   *
+   * The squared-range test alone is not enough. A no-return ray reported as infinity passes
+   * `range > blind * blind`, and nothing downstream screens it: pl_surf is built fresh with
+   * is_dense defaulting to true, so pcl::VoxelGrid skips its non-finite check, its bounding
+   * box becomes infinite, and the whole scan downsamples to nothing -- "No Effective Points"
+   * on every frame. NaN happens to be rejected by the same comparison being false for NaN,
+   * which is luck rather than intent.
+   *
+   * The Livox driver only ever publishes measured returns, so this costs nothing there. It
+   * matters for any source that pads a fixed-size grid with infinity, which is what Gazebo's
+   * gpu_lidar does for rays that hit nothing.
+   */
+  template <typename T>
+  static inline bool is_usable_point(const T &point, double blind)
+  {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+    {
+      return false;
+    }
+    const double range_squared = (point.x * point.x) + (point.y * point.y) + (point.z * point.z);
+    return range_squared > (blind * blind);
+  }
+}  // namespace
 
 Preprocess::Preprocess() : feature_enabled(0), lidar_type(AVIA), blind(0.01), point_filter_num(1)
 {
@@ -183,7 +213,7 @@ void Preprocess::avia_handler(const livox_ros_driver2::msg::CustomMsg::UniquePtr
           if (((abs(pl_full[i].x - pl_full[i - 1].x) > 1e-7)
               || (abs(pl_full[i].y - pl_full[i - 1].y) > 1e-7)
               || (abs(pl_full[i].z - pl_full[i - 1].z) > 1e-7))
-              && (pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z > (blind * blind)))
+              && is_usable_point(pl_full[i], blind))
           {
             pl_surf.push_back(pl_full[i]);
           }
@@ -215,7 +245,7 @@ void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     {
       double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y +
                      pl_orig.points[i].z * pl_orig.points[i].z;
-      if (range < (blind * blind))
+      if (range < (blind * blind) || !std::isfinite(range))
         continue;
       Eigen::Vector3d pt_vec;
       PointType added_pt;
@@ -272,7 +302,7 @@ void Preprocess::oust64_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
       double range = pl_orig.points[i].x * pl_orig.points[i].x + pl_orig.points[i].y * pl_orig.points[i].y +
                      pl_orig.points[i].z * pl_orig.points[i].z;
 
-      if (range < (blind * blind))
+      if (range < (blind * blind) || !std::isfinite(range))
         continue;
 
       Eigen::Vector3d pt_vec;
@@ -464,7 +494,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
 
       if (i % point_filter_num == 0)
       {
-        if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+        if (is_usable_point(added_pt, blind))
         {
           pl_surf.points.push_back(added_pt);
         }
@@ -549,7 +579,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     yaw_last[layer] = yaw_angle;
     time_last[layer] = added_pt.curvature;
 
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    if (is_usable_point(added_pt, blind))
     {
       pl_surf.push_back(std::move(added_pt));
     }
@@ -581,7 +611,7 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
     added_pt.intensity = pl_orig.points[i].intensity;
     added_pt.curvature = 0.;
 
-    if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    if (is_usable_point(added_pt, blind))
     {
       pl_surf.push_back(std::move(added_pt));
     }
