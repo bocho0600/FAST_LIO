@@ -67,6 +67,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <rclcpp_components/register_node_macro.hpp>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -1514,6 +1515,8 @@ private:
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
 };
+
+RCLCPP_COMPONENTS_REGISTER_NODE(LaserMappingNode)
 
 int main(int argc, char** argv)
 {
