@@ -1184,6 +1184,20 @@ public:
 
     ~LaserMappingNode()
     {
+        /* Save on exit so shutting down does not discard up to a whole
+           pcd_save.save_interval_sec of mapping. Lives here rather than in main() so it still
+           runs when this node is loaded into a shared component container instead of spun as
+           its own process -- a container's own main() has no way to know this class wants a
+           save on destruction. */
+        if (pcd_save_en)
+        {
+            string message;
+            if (save_to_pcd(message))
+                RCLCPP_INFO(this->get_logger(), "map saved on exit: %s", message.c_str());
+            else
+                RCLCPP_WARN(this->get_logger(), "map not saved on exit: %s", message.c_str());
+        }
+
         fout_out.close();
         fout_pre.close();
         fclose(fp);
@@ -1511,20 +1525,6 @@ int main(int argc, char** argv)
 
     if (rclcpp::ok())
         rclcpp::shutdown();
-    /**************** save map ****************/
-    /* Save on exit so shutting down does not discard up to a whole
-       pcd_save.save_interval_sec of mapping.
-
-       This used to write pcl_wait_save to ROOT_DIR/PCD/scans.pcd. Neither part worked:
-       pcl_wait_save is only appended to by a block that upstream left commented out, so
-       it was always empty, and ROOT_DIR is read-only when the package is installed to a
-       store path. Use the same buffer and destination as the service instead. */
-    if (pcd_save_en)
-    {
-        string message;
-        if (save_to_pcd(message)) cout << "map saved on exit: " << message << endl;
-        else                      cout << "map not saved on exit: " << message << endl;
-    }
 
     if (runtime_pos_log)
     {

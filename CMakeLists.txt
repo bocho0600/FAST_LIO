@@ -111,9 +111,33 @@ target_link_libraries(fastlio_mapping ${cpp_typesupport_target})
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+# Same node, built again as a component so it can be loaded into a shared container with
+# another node (e.g. a point cloud pre-filter) and pass messages between them by pointer
+# instead of over DDS. LaserMappingNode already takes rclcpp::NodeOptions, so no class changes
+# were needed -- just this registration.
+add_library(fastlio_mapping_component SHARED
+  src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
+target_include_directories(fastlio_mapping_component PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(fastlio_mapping_component ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen)
+target_include_directories(fastlio_mapping_component PRIVATE ${PYTHON_INCLUDE_DIRS})
+target_link_libraries(fastlio_mapping_component ${cpp_typesupport_target})
+ament_target_dependencies(fastlio_mapping_component ${dependencies})
+rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")
+
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  TARGETS fastlio_mapping_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
 )
 
 install(
