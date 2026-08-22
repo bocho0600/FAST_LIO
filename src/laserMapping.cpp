@@ -114,6 +114,20 @@ bool   is_base_extrinsic_valid = false;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
+/*** How the sensor streams are delivered. Best-effort by default, because a sample is
+     only useful while it is current: a lost scan costs one update, a late scan drags the
+     estimate behind reality. Set common.lidar_qos_reliable when the publisher sits across
+     a link that loses fragments and the extra latency is worth paying -- a PointCloud2
+     from a MID-360 is around half a megabyte, so UDP fragments it into hundreds of
+     datagrams and one lost datagram discards the whole scan. ***/
+bool   lidar_qos_reliable = false;
+int    lidar_queue_depth = 20;
+int    imu_queue_depth = 200;
+/*** A timestamp that goes backwards by more than this is a replay restarting, so whatever
+     is queued belongs to the previous pass and is worthless. A smaller step back is the
+     transport reordering two samples, where only the late sample itself is unusable and
+     the queue is still good. Clearing the queue for that throws away good scans. ***/
+constexpr double SENSOR_LOOP_BACK_TOLERANCE_S = 1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -316,8 +330,24 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
+        if (cur_time < last_timestamp_lidar - SENSOR_LOOP_BACK_TOLERANCE_S)
+        {
+            std::cerr << "lidar time jumped back " << (last_timestamp_lidar - cur_time)
+                      << " s, dropping " << lidar_buffer.size() << " queued scans"
+                      << std::endl;
+            /*** both, and always together: sync_packages() pairs lidar_buffer.front()
+                 with time_buffer.front(), so clearing one alone leaves every later scan
+                 matched to the wrong timestamp ***/
+            lidar_buffer.clear();
+            time_buffer.clear();
+        }
+        else
+        {
+            /*** reordered in transit: older than a scan already queued, so it cannot be
+                 used, but nothing already queued is invalidated by it ***/
+            mtx_buffer.unlock();
+            return;
+        }
     }
     if (is_first_lidar)
     {
@@ -344,8 +374,19 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        lidar_buffer.clear();
+        if (cur_time < last_timestamp_lidar - SENSOR_LOOP_BACK_TOLERANCE_S)
+        {
+            std::cerr << "lidar time jumped back " << (last_timestamp_lidar - cur_time)
+                      << " s, dropping " << lidar_buffer.size() << " queued scans"
+                      << std::endl;
+            lidar_buffer.clear();
+            time_buffer.clear();
+        }
+        else
+        {
+            mtx_buffer.unlock();
+            return;
+        }
     }
     if(is_first_lidar)
     {
@@ -395,8 +436,18 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     if (timestamp < last_timestamp_imu)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
-        imu_buffer.clear();
+        if (timestamp < last_timestamp_imu - SENSOR_LOOP_BACK_TOLERANCE_S)
+        {
+            std::cerr << "imu time jumped back " << (last_timestamp_imu - timestamp)
+                      << " s, dropping " << imu_buffer.size() << " queued samples"
+                      << std::endl;
+            imu_buffer.clear();
+        }
+        else
+        {
+            mtx_buffer.unlock();
+            return;
+        }
     }
 
     last_timestamp_imu = timestamp;
@@ -946,6 +997,9 @@ public:
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<bool>("common.lidar_qos_reliable", false);
+        this->declare_parameter<int>("common.lidar_queue_depth", 20);
+        this->declare_parameter<int>("common.imu_queue_depth", 200);
         this->declare_parameter<string>("common.map_frame", "camera_init");
         this->declare_parameter<string>("common.body_frame", "body");
         this->declare_parameter<string>("common.lid_frame", "lidar");
@@ -995,6 +1049,9 @@ public:
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
+        this->get_parameter_or<bool>("common.lidar_qos_reliable", lidar_qos_reliable, false);
+        this->get_parameter_or<int>("common.lidar_queue_depth", lidar_queue_depth, 20);
+        this->get_parameter_or<int>("common.imu_queue_depth", imu_queue_depth, 200);
         this->get_parameter_or<string>("common.map_frame", map_frame, "camera_init");
         this->get_parameter_or<string>("common.body_frame", body_frame, "body");
         this->get_parameter_or<string>("common.lid_frame", lid_frame, "lidar");
@@ -1093,15 +1150,34 @@ public:
             cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
         /*** ROS subscribe initialization ***/
-        if (p_pre->lidar_type == AVIA)
+        /*** Both LiDAR branches take the same QoS. Which message type the sensor happens
+             to speak should not decide whether its scans survive the transport, and it
+             used to: CustomMsg got the default profile at depth 20 (reliable), while
+             PointCloud2 got SensorDataQoS (best-effort, depth 5). A MID-360 speaks
+             PointCloud2, so it drew the weaker of the two by accident. ***/
+        auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(lidar_queue_depth)));
+        if (lidar_qos_reliable)
         {
-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
+            lidar_qos.reliable();
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
+            lidar_qos.best_effort();
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+
+        if (p_pre->lidar_type == AVIA)
+        {
+            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, lidar_qos, livox_pcl_cbk);
+        }
+        else
+        {
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, lidar_qos, standard_pcl_cbk);
+        }
+        /*** 200 samples is a second of a 200 Hz IMU. The old depth of 10 held 50 ms, so
+             any stall in this thread -- the periodic whole-map PCD write is the usual one
+             -- dropped samples the de-skewing then had to do without. ***/
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            imu_topic, rclcpp::QoS(rclcpp::KeepLast(static_cast<size_t>(imu_queue_depth))), imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
