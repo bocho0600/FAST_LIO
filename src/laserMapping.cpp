@@ -58,6 +58,8 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+#include <atomic>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
@@ -1242,6 +1244,9 @@ public:
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
+        /*** /set_mapping false switches to localisation only: see mapping_enabled_ ***/
+        set_mapping_srv_ = this->create_service<std_srvs::srv::SetBool>("set_mapping", std::bind(&LaserMappingNode::set_mapping_callback, this, std::placeholders::_1, std::placeholders::_2));
+
         /*** periodic map saving. Uses the node clock, so unlike a wall timer it honours
              use_sim_time. Left disabled (interval <= 0) means /map_save on demand only ***/
         if (pcd_save_en && pcd_save_interval_sec > 0.0)
@@ -1411,8 +1416,21 @@ private:
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
                             false : true;
-            /*** Segment the map in lidar FOV ***/
-            lasermap_fov_segment();
+            /*** Segment the map in lidar FOV.
+                 Skipped when mapping is off, and that is not just an optimisation: this is
+                 what slides the local cube, and sliding it calls Delete_Point_Boxes() on
+                 everything left behind. Freezing map_incremental() alone would leave a map
+                 that can still shrink but can never grow, so it would erode as the robot
+                 drives. ***/
+            if (mapping_enabled_)
+            {
+                lasermap_fov_segment();
+            }
+            else
+            {
+                kdtree_delete_counter = 0;
+                kdtree_delete_time = 0.0;
+            }
 
             /*** downsample the feature points in a scan ***/
             downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1487,9 +1505,21 @@ private:
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
             if (publish_tf_base_en) publish_base_tf();
 
-            /*** add the feature points to map kdtree ***/
+            /*** add the feature points to map kdtree, unless the map is frozen.
+                 Registration above is unaffected: it searches the existing ikd-Tree, so
+                 odometry continues against whatever was mapped before the freeze. The
+                 counters are cleared rather than left stale so runtime_pos_log_enable keeps
+                 reporting the truth. ***/
             t3 = omp_get_wtime();
-            map_incremental();
+            if (mapping_enabled_)
+            {
+                map_incremental();
+            }
+            else
+            {
+                add_point_size = 0;
+                kdtree_incremental_time = 0.0;
+            }
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1536,6 +1566,29 @@ private:
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
+    /// Toggle map building. false = localisation only: scans keep registering against the
+    /// map already built, but nothing is added to it and nothing is trimmed from it.
+    ///
+    /// Note what this does NOT do: it is not relocalisation. There is no way to load a saved
+    /// map and find the robot in it -- the frozen map is whatever this run built. Drive
+    /// outside it and there is nothing left to register against, so the filter falls back to
+    /// IMU propagation and drifts with nothing to pull it back.
+    void set_mapping_callback(std_srvs::srv::SetBool::Request::ConstSharedPtr req, std_srvs::srv::SetBool::Response::SharedPtr res)
+    {
+        const bool was_enabled = mapping_enabled_.exchange(req->data);
+        res->success = true;
+        res->message = req->data ? "mapping enabled: map grows and is trimmed with the local cube"
+                                 : "localisation only: map frozen, scans still register against it";
+        if (was_enabled == req->data)
+        {
+            RCLCPP_INFO(this->get_logger(), "Unchanged, already %s", res->message.c_str());
+        }
+        else
+        {
+            RCLCPP_INFO(this->get_logger(), "%s", res->message.c_str());
+        }
+    }
+
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
         if (!pcd_save_en)
@@ -1580,6 +1633,10 @@ private:
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_mapping_srv_;
+    /*** false freezes the ikd-Tree. Atomic because the service callback and timer_callback
+         are separate callbacks, and nothing here guarantees they share a thread. ***/
+    std::atomic<bool> mapping_enabled_{true};
     rclcpp::TimerBase::SharedPtr map_save_timer_;
 
     bool effect_pub_en = false, map_pub_en = false;
