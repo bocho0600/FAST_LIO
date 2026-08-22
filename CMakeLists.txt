@@ -79,7 +79,9 @@ set(dependencies
 
 # Thirdparty libraries
 find_package(Eigen3 REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io)
+# filters (VoxelGrid), registration (ICP) and kdtree (FLANN) are for the
+# global_localization node; common and io were all the mapping node needed.
+find_package(PCL REQUIRED COMPONENTS common io filters registration kdtree)
 
 message(Eigen: ${EIGEN3_INCLUDE_DIR})
 message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
@@ -128,8 +130,20 @@ target_link_libraries(fastlio_mapping_component ${cpp_typesupport_target})
 ament_target_dependencies(fastlio_mapping_component ${dependencies})
 rclcpp_components_register_nodes(fastlio_mapping_component "LaserMappingNode")
 
+# Re-localisation against a prior map. A separate executable on purpose: fastlio_mapping is
+# spun single-threaded, so an ICP running inside it would block its 100 Hz timer and drop
+# scans. Off unless relocalization.enable is set, so building it costs nothing at runtime.
+add_executable(global_localization src/global_localization.cpp)
+target_include_directories(global_localization PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(global_localization ${PCL_LIBRARIES} Eigen3::Eigen)
+ament_target_dependencies(global_localization ${dependencies})
+
 # ---------------- Install --------------- #
-install(TARGETS fastlio_mapping
+install(TARGETS fastlio_mapping global_localization
   DESTINATION lib/${PROJECT_NAME}
 )
 
