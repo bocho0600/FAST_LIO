@@ -118,7 +118,7 @@ typedef struct {
   float x;            /**< X axis, Unit:m */
   float y;            /**< Y axis, Unit:m */
   float z;            /**< Z axis, Unit:m */
-  float reflectivity; /**< Reflectivity   */
+  float reflectivity; /**< Reflectivity. Named `intensity` on the wire; see the registration below. */
   uint8_t tag;        /**< Livox point tag   */
   uint8_t line;       /**< Laser line id     */
 } LivoxPointXyzrtl;
@@ -127,7 +127,21 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (float, x, x)
     (float, y, y)
     (float, z, z)
-    (float, reflectivity, reflectivity)
+    // The third element is the name PCL matches against the PointCloud2 field,
+    // and livox_ros_driver2 publishes this channel as `intensity` (lddc.cpp),
+    // not `reflectivity`. Registered under the wrong name, createMapping finds
+    // no match and PCL_WARNs "Failed to find exact match for field
+    // 'reflectivity'" -- once per scan, since fromPCLPointCloud2 rebuilds the
+    // field map on every call.
+    //
+    // The value still arrived, but only by luck: this struct's layout is
+    // byte-identical to the driver's wire layout, so the coalescing pass in
+    // pcl::createMapping merges x/y/z and tag/line straight across the
+    // unmatched 4-byte hole and one 18-byte memcpy carries the field anyway.
+    // That is the case conversions.h's own @todo calls pathological. Naming the
+    // field as the driver does makes the mapping explicit instead of a
+    // coincidence of padding.
+    (float, reflectivity, intensity)
     (uint8_t, tag, tag)
     (uint8_t, line, line)
 )
