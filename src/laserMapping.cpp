@@ -86,6 +86,9 @@ bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extri
 bool   gravity_align_en = false;
 // put the world origin on base_frame's initial pose instead of the IMU's
 bool   origin_at_base_en = false;
+// put the world *heading* on base_frame's too. Separate from origin_at_base_en, which only
+// seeds position: see the yaw block in ImuProcess::IMU_init for why the two are distinct.
+bool   heading_at_base_en = false;
 // OpenMP threads for the per-point residual loop; <= 0 means one fewer than available
 int    max_threads = 3;
 /**************************/
@@ -1021,6 +1024,7 @@ public:
         this->declare_parameter<string>("common.base_frame", "base_link");
         this->declare_parameter<bool>("common.gravity_align_en", false);
         this->declare_parameter<bool>("common.origin_at_base_en", false);
+        this->declare_parameter<bool>("common.heading_at_base_en", false);
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -1073,6 +1077,7 @@ public:
         this->get_parameter_or<string>("common.base_frame", base_frame, "base_link");
         this->get_parameter_or<bool>("common.gravity_align_en", gravity_align_en, false);
         this->get_parameter_or<bool>("common.origin_at_base_en", origin_at_base_en, false);
+        this->get_parameter_or<bool>("common.heading_at_base_en", heading_at_base_en, false);
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -1142,6 +1147,14 @@ public:
         Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
         p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
         p_imu->set_gravity_align(gravity_align_en);
+        p_imu->set_heading_at_base(heading_at_base_en);
+        if (heading_at_base_en && !gravity_align_en)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "common.heading_at_base_en with gravity_align_en off: world z is the "
+                        "IMU's own z, not up, so the yaw removed is not a heading. Enable "
+                        "common.gravity_align_en for this to mean what it says.");
+        }
         p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
         p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
@@ -1224,7 +1237,7 @@ public:
         }
 
         /*** composing a base_frame pose needs TF to find where the base is relative to the sensor ***/
-        if (publish_tf_base_en || publish_odom_in_base_en || origin_at_base_en)
+        if (publish_tf_base_en || publish_odom_in_base_en || origin_at_base_en || heading_at_base_en)
         {
             tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
             tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this);
@@ -1346,7 +1359,7 @@ private:
         Eigen::Isometry3d transform_imu_lidar = Eigen::Isometry3d::Identity();
         transform_imu_lidar.linear() = Lidar_R_wrt_IMU;
         transform_imu_lidar.translation() = Lidar_T_wrt_IMU;
-        p_imu->set_base_offset((transform_imu_lidar * transform_lidar_base).translation());
+        p_imu->set_base_offset(transform_imu_lidar * transform_lidar_base);
     }
 
     /// Read lid_frame -> base_frame from TF once and cache it. Returns whether it is available.
@@ -1387,14 +1400,14 @@ private:
             /*** Resolve lid_frame -> base_frame before the filter initialises. origin_at_base_en
                  needs it inside IMU_init, so hold off entirely until TF provides it rather than
                  initialise around the IMU and be silently offset for the rest of the run. ***/
-            if ((publish_tf_base_en || publish_odom_in_base_en || origin_at_base_en) &&
-                !is_base_extrinsic_valid)
+            if ((publish_tf_base_en || publish_odom_in_base_en || origin_at_base_en ||
+                 heading_at_base_en) && !is_base_extrinsic_valid)
             {
                 if (resolve_base_extrinsic())
                 {
                     push_base_offset_to_imu();
                 }
-                else if (origin_at_base_en)
+                else if (origin_at_base_en || heading_at_base_en)
                 {
                     return;
                 }

@@ -47,7 +47,8 @@ class ImuProcess
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
   void set_gravity_align(bool en);
-  void set_base_offset(const V3D &translation_imu_base);
+  void set_base_offset(const Eigen::Isometry3d &transform_imu_base);
+  void set_heading_at_base(bool en);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
 
@@ -82,8 +83,12 @@ class ImuProcess
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
   bool   gravity_align_en = false;
-  /// Where base_frame sits in IMU coordinates, used to move the world origin onto it.
+  bool   heading_at_base_en = false;
+  /// Where base_frame sits in IMU coordinates, used to move the world origin onto it. The
+  /// rotation is needed as well as the translation: it is what turns the sensor's startup
+  /// heading into base_frame's (see IMU_init).
   V3D    translation_imu_base = Zero3d;
+  M3D    rotation_imu_base = Eye3d;
   bool   is_base_offset_set = false;
 };
 
@@ -102,7 +107,9 @@ ImuProcess::ImuProcess()
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   gravity_align_en = false;
+  heading_at_base_en = false;
   translation_imu_base = Zero3d;
+  rotation_imu_base = Eye3d;
   is_base_offset_set = false;
   last_imu_.reset(new sensor_msgs::msg::Imu());
 }
@@ -167,10 +174,16 @@ void ImuProcess::set_gravity_align(bool en)
   gravity_align_en = en;
 }
 
-void ImuProcess::set_base_offset(const V3D &translation_imu_base_in)
+void ImuProcess::set_base_offset(const Eigen::Isometry3d &transform_imu_base)
 {
-  translation_imu_base = translation_imu_base_in;
+  translation_imu_base = transform_imu_base.translation();
+  rotation_imu_base = transform_imu_base.linear();
   is_base_offset_set = true;
+}
+
+void ImuProcess::set_heading_at_base(bool en)
+{
+  heading_at_base_en = en;
 }
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
@@ -245,6 +258,39 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
    * leaving the orientation (and so the gravity alignment above) untouched. Because this
    * shifts the state itself rather than the published pose, the map is built in the same
    * frame and stays consistent with the odometry. ***/
+  /*** Move the world heading onto base_frame instead of the IMU.
+   *
+   * Gravity alignment above fixes roll and pitch only -- FromTwoVectors gives the minimal
+   * rotation taking measured gravity onto +z, and an accelerometer cannot observe yaw. So the
+   * world frame inherits the IMU's startup heading, and the IMU lives inside the LiDAR
+   * housing, which is mounted at whatever yaw the mast bracket imposes. base_frame therefore
+   * starts at the inverse of that mounting yaw rather than at zero: on Perseus the Livox is
+   * seated a quarter turn round, so base_link came up exactly 90 degrees off odom.
+   *
+   * origin_at_base_en does not help, because it only seeds position.
+   *
+   * Removing base_frame's initial yaw from the world frame fixes it. The rotation is about
+   * world z, which gravity alignment has already made vertical, so roll, pitch and the
+   * gravity vector (0, 0, -G) are all preserved -- only the heading moves. As with the
+   * position seeding this shifts the state rather than the published pose, so the map is
+   * built in the same frame and stays consistent with the odometry.
+   *
+   * Deliberately NOT folded into origin_at_base_en: that parameter is documented as moving
+   * the origin, and silently giving it a second meaning would change behaviour for anyone
+   * already setting it.
+   *
+   * Without gravity alignment the world z axis is just the IMU's, so "yaw" is not a heading
+   * and this is close to meaningless; laserMapping warns about that combination. ***/
+  if (is_base_offset_set && heading_at_base_en)
+  {
+    const M3D R_world_base = init_state.rot.matrix() * rotation_imu_base;
+    const double base_yaw = std::atan2(R_world_base(1, 0), R_world_base(0, 0));
+    init_state.rot = SO3(M3D(Eigen::AngleAxisd(-base_yaw, V3D::UnitZ()).toRotationMatrix() *
+                             init_state.rot.matrix()));
+  }
+
+  /*** Position seeding runs after the heading, because it rotates the offset by
+       init_state.rot and so must see the final orientation. ***/
   if (is_base_offset_set)
   {
     init_state.pos = -(init_state.rot * translation_imu_base);
